@@ -65,3 +65,28 @@ app.post("/api/parar", (req, res) => {
 app.listen(PORT, () => {
   console.log(`✅ Backend rodando em http://localhost:${PORT}`);
 });
+
+// Endpoint para streaming de logs via SSE
+app.get("/api/logs/stream", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  let lastIndex = 0;
+
+  const sendLogs = () => {
+    if (lastIndex < estado.logs.length) {
+      const novosLogs = estado.logs.slice(lastIndex);
+      res.write(`data: ${JSON.stringify(novosLogs)}\n\n`);
+      lastIndex = estado.logs.length;
+    }
+  };
+
+  const interval = setInterval(sendLogs, 1000);
+
+  req.on("close", () => {
+    clearInterval(interval);
+    res.end();
+  });
+});
