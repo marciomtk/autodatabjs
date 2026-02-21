@@ -1,5 +1,6 @@
 /**
  * automacao.js — Beija-Flor ERP
+ * Suporta cancelamento seguro via sinal externo (parar())
  */
 
 const puppeteer = require("puppeteer");
@@ -13,19 +14,29 @@ const SEL = {
   campoUsuario: "input[name='Login']",
   campoSenha: "input[name='Senha']",
   botaoLogin: "#btnEnviar",
-  menuLista: "a[href='/MeusClientes']",
   tabelaLinhas: "#revendas tbody tr[role='row']",
   campoDelta: "#ValidadeLicenca",
   botaoSalvar: "#btnGravar",
 };
 
+// ── Sinal de cancelamento ──────────────────────────────────────
+// O server.js chama cancelar() para pedir parada.
+// A automação verifica deveParar() a cada iteração.
+let _parar = false;
+function cancelar() {
+  _parar = true;
+}
+function deveParar() {
+  return _parar;
+}
+function resetarSinal() {
+  _parar = false;
+}
+
 function calcularNovaData() {
   const hoje = new Date();
   const proximo = new Date(hoje.getFullYear(), hoje.getMonth() + 1, 20);
-  const dd = "20";
-  const mm = String(proximo.getMonth() + 1).padStart(2, "0");
-  const aa = proximo.getFullYear();
-  return `${dd}/${mm}/${aa}`;
+  return `20/${String(proximo.getMonth() + 1).padStart(2, "0")}/${proximo.getFullYear()}`;
 }
 
 function deveEditarData(dataAtualBruta) {
@@ -42,8 +53,7 @@ function deveEditarData(dataAtualBruta) {
   );
 }
 
-// Navega para uma URL esperando o seletor aparecer (mais robusto que waitForNavigation)
-async function irPara(page, url, seletorEsperar, log) {
+async function irPara(page, url, seletorEsperar) {
   await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60000 });
   if (seletorEsperar) {
     await page.waitForSelector(seletorEsperar, { timeout: 30000 });
@@ -51,6 +61,8 @@ async function irPara(page, url, seletorEsperar, log) {
 }
 
 async function executarAutomacao(onLog) {
+  resetarSinal(); // garante que começa sem sinal de parada
+
   const log = (msg, tipo = "info") => {
     console.log(`[${tipo.toUpperCase()}] ${msg}`);
     onLog({ msg, tipo, hora: new Date().toLocaleTimeString("pt-BR") });
@@ -72,12 +84,13 @@ async function executarAutomacao(onLog) {
   let sucesso = 0;
   let pulados = 0;
   let falha = 0;
+  let parado = false;
 
   const novaData = calcularNovaData();
   log(`📅 Nova data que será aplicada: ${novaData}`);
 
   try {
-    // ── ETAPA 1: Login ─────────────────────────────────────────
+    // ── Login ──────────────────────────────────────────────────
     log("🌐 Abrindo Beija-Flor ERP...");
     await page.goto(SITE_URL, {
       waitUntil: "domcontentloaded",
@@ -88,48 +101,41 @@ async function executarAutomacao(onLog) {
     log("🔑 Fazendo login — usuário: " + LOGIN_USER);
     await page.type(SEL.campoUsuario, LOGIN_USER, { delay: 80 });
     await page.type(SEL.campoSenha, LOGIN_PASS, { delay: 80 });
-
     await Promise.all([
       page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60000 }),
       page.click(SEL.botaoLogin),
     ]);
-    log(`✅ Login realizado!`, "sucesso");
+    log("✅ Login realizado!", "sucesso");
 
-    // ── ETAPA 2: Navegar direto para /MeusClientes via URL ─────
-    // Mais confiável do que clicar no menu (evita timeout de navegação SPA)
+    // ── Meus Clientes ──────────────────────────────────────────
     log("📋 Abrindo Meus Clientes...");
     await irPara(
       page,
       "https://revenda.beijaflorerp.com.br/MeusClientes",
       SEL.tabelaLinhas,
-      log,
     );
-
-    // Pausa para DataTable terminar de renderizar
     await new Promise((r) => setTimeout(r, 2000));
     log("✅ Lista carregada!", "sucesso");
 
-    // ── ETAPA 3: Coletar registros ─────────────────────────────
+    // ── Coletar registros ──────────────────────────────────────
     const registros = await page.$$eval(SEL.tabelaLinhas, (rows) =>
       rows
         .map((tr) => {
           const colunas = tr.querySelectorAll("td");
           const situacao = colunas[0] ? colunas[0].innerText.trim() : "";
+          const nome = colunas[3] ? colunas[3].innerText.trim() : "";
           const linkEdit = tr.querySelector("a[href*='/MeusClientes/Editar/']");
-          return { situacao, url: linkEdit ? linkEdit.href : null };
+          return { situacao, nome, url: linkEdit ? linkEdit.href : null };
         })
         .filter((r) => r.url),
     );
 
     const total = registros.length;
-    log(`📊 ${total} cliente(s) encontrado(s) na lista.`);
+    log(`📊 ${total} cliente(s) encontrado(s).`);
 
     if (total === 0) {
-      log(
-        "⚠️  Nenhum cliente encontrado. Verifique se a tabela carregou.",
-        "aviso",
-      );
-      return { sucesso: 0, pulados: 0, falha: 0, total: 0 };
+      log("⚠️  Nenhum cliente encontrado.", "aviso");
+      return { sucesso: 0, pulados: 0, falha: 0, total: 0, parado: false };
     }
 
     const contSituacoes = registros.reduce((acc, r) => {
@@ -140,10 +146,23 @@ async function executarAutomacao(onLog) {
       log(`   ${sit}: ${qtd} cliente(s)`),
     );
 
-    // ── ETAPA 4: Processar cada cliente ───────────────────────
+    // ── Loop principal ─────────────────────────────────────────
     for (let i = 0; i < registros.length; i++) {
-      const { situacao, url } = registros[i];
-      log(`── Cliente ${i + 1} / ${total} — Situação: "${situacao}"`);
+      // ✋ Verifica sinal de parada ANTES de cada cliente
+      if (deveParar()) {
+        parado = true;
+        log(
+          `✋ Automação interrompida pelo usuário após ${i} cliente(s).`,
+          "aviso",
+        );
+        break;
+      }
+
+      const { situacao, nome, url } = registros[i];
+      const nomeLabel = nome ? ` ${nome}` : "";
+      log(
+        `── Cliente ${i + 1}${nomeLabel} / ${total} — Situação: "${situacao}"`,
+      );
 
       if (situacao.toLowerCase() !== "ativa") {
         log(`  ⏭️  Pulado — situação: "${situacao}"`, "aviso");
@@ -152,7 +171,7 @@ async function executarAutomacao(onLog) {
       }
 
       try {
-        await irPara(page, url, SEL.campoDelta, log);
+        await irPara(page, url, SEL.campoDelta);
 
         const dataAtualBruta = await page.$eval(
           SEL.campoDelta,
@@ -195,11 +214,17 @@ async function executarAutomacao(onLog) {
     }
 
     log("─".repeat(45));
-    log(`🏁 Concluído!`);
+    if (parado) {
+      log(`✋ Interrompido pelo usuário.`, "aviso");
+    } else {
+      log(`🏁 Concluído com sucesso!`);
+    }
     log(`   ✅ Atualizados : ${sucesso}`);
     log(`   ⏭️  Pulados     : ${pulados}`);
     log(`   ❌ Erros        : ${falha}`);
-    log(`   📊 Total        : ${total}`);
+    log(
+      `   📊 Processados  : ${sucesso + pulados + falha} de ${registros.length}`,
+    );
   } catch (err) {
     log(`💥 Erro crítico: ${err.message}`, "erro");
     throw err;
@@ -207,7 +232,7 @@ async function executarAutomacao(onLog) {
     await browser.close();
   }
 
-  return { sucesso, pulados, falha, total: sucesso + pulados + falha };
+  return { sucesso, pulados, falha, total: sucesso + pulados + falha, parado };
 }
 
-module.exports = { executarAutomacao };
+module.exports = { executarAutomacao, cancelar };
