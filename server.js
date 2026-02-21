@@ -62,7 +62,7 @@ app.post("/api/parar", (req, res) => {
   res.json({ ok: true, msg: "Sinal de parada enviado." });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`✅ Backend rodando em http://0.0.0.0:${PORT}`);
 });
 
