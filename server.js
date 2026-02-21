@@ -5,7 +5,7 @@ const cors = require("cors");
 const { executarAutomacao, cancelar } = require("./automacao");
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 8080;
 
 app.use(cors());
 app.use(express.json());
@@ -62,8 +62,8 @@ app.post("/api/parar", (req, res) => {
   res.json({ ok: true, msg: "Sinal de parada enviado." });
 });
 
-app.listen(PORT, () => {
-  console.log(`✅ Backend rodando em http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Backend rodando em http://0.0.0.0:${PORT}`);
 });
 
 // Endpoint para streaming de logs via SSE
